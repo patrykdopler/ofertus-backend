@@ -1,145 +1,153 @@
-
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 from docx import Document
 from docx.shared import Inches
 from openpyxl import load_workbook
 from io import BytesIO
 import zipfile
 
+
+# -------------------------------------------------------
+# FASTAPI + CORS (konieczne dla Netlify → Render)
+# -------------------------------------------------------
+
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # można wpisać domenę Netlify
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def extract_positions(xlsx_bytes: bytes):
-    # Odczytuje pozycje z arkusza 'Arkusz1'.
-    # Szuka w kolumnie 7 (G) tekstów zaczynających się od 'Poz.'
-    # oraz w kolumnie 6 (F) etykiet: 'Nazwa:', 'Opis:', 'Wypełnienia:', 'Ilość:'.
-    wb = load_workbook(BytesIO(xlsx_bytes), data_only=True)
-    ws = wb['Arkusz1']
-    max_row = ws.max_row
 
-    poz_rows = []
-    for r in range(1, max_row + 1):
-        v = ws.cell(row=r, column=7).value
-        if isinstance(v, str) and v.strip().startswith('Poz.'):
-            poz_rows.append(r)
+# -------------------------------------------------------
+# ODCZYT POZYCJI Z XLSX
+# -------------------------------------------------------
+
+def extract_positions(workbook):
+    sheet = workbook.active
+    max_row = sheet.max_row
 
     positions = []
-    for idx, base_row in enumerate(poz_rows, start=1):
-        block_start = base_row
-        block_end = poz_rows[idx] - 1 if idx < len(poz_rows) else min(max_row, base_row + 40)
+    current = None
 
-        info = {
-            'lp': idx,
-            'nazwa': ws.cell(row=base_row, column=7).value or '',
-            'ilosc': '',
-            'opis': '',
-            'image': None,
-        }
+    for i in range(1, max_row + 1):
+        c6 = sheet.cell(i, 6).value
+        c7 = sheet.cell(i, 7).value
 
-        for r in range(block_start, block_end + 1):
-            label = ws.cell(row=r, column=6).value
-            if isinstance(label, str):
-                t = label.strip()
-                if t == 'Ilość:':
-                    val = ws.cell(row=r, column=7).value
-                    if val is not None:
-                        info['ilosc'] = str(val)
-                elif t in ('Wypełnienia:', 'Opis:'):
-                    val = ws.cell(row=r, column=7).value
-                    if val:
-                        text = str(val).replace('\n', ' ').replace('_x000D_', ' ')
-                        if info['opis']:
-                            info['opis'] += ' '
-                        info['opis'] += text
+        if isinstance(c7, str) and c7.startswith("Poz."):
+            if current:
+                positions.append(current)
 
-        positions.append(info)
+            current = {
+                "lp": len(positions) + 1,
+                "nazwa": c7,
+                "ilosc": "",
+                "opis": "",
+                "image": None
+            }
+
+        if current is not None:
+            if c6 == "Ilość:":
+                current["ilosc"] = str(c7)
+            elif c6 in ("Wypełnienia:", "Opis:"):
+                if c7:
+                    text = str(c7).replace("\n", " ").replace("_x000D_", " ")
+                    current["opis"] += " " + text
+
+    if current:
+        positions.append(current)
 
     return positions
 
 
-def extract_images(xlsx_bytes: bytes):
-    # Czyta pliki graficzne z xl/media w XLSX.
+# -------------------------------------------------------
+# WYCIĄGANIE OBRAZÓW Z XLSX (xl/media)
+# -------------------------------------------------------
+
+def extract_images(xlsx_bytes):
     images = []
     with zipfile.ZipFile(BytesIO(xlsx_bytes)) as z:
-        media_files = sorted(
-            name
-            for name in z.namelist()
-            if name.startswith('xl/media/')
-            and (name.lower().endswith('.png') or name.lower().endswith('.jpg') or name.lower().endswith('.jpeg'))
-        )
-        for name in media_files:
-            images.append(z.read(name))
+        for name in sorted(z.namelist()):
+            if name.startswith("xl/media") and (
+                name.lower().endswith(".jpg")
+                or name.lower().endswith(".jpeg")
+                or name.lower().endswith(".png")
+            ):
+                images.append(z.read(name))
     return images
 
 
-def add_image_below_text(cell, image_bytes: bytes, target_px_width: int = 500):
-    # Dodaje obraz pod istniejącym tekstem w komórce.
+# -------------------------------------------------------
+# DODAWANIE OBRAZU DO KOMÓRKI POD NAZWĄ
+# -------------------------------------------------------
+
+def add_image_to_cell(cell, image_bytes, width_px=500):
     if not image_bytes:
         return
-    width_inch = target_px_width / 96.0  # 96 dpi ~ 96 px/cal
+
+    width_inch = width_px / 96.0  # 96 dpi
     paragraph = cell.add_paragraph()
     run = paragraph.add_run()
     run.add_picture(BytesIO(image_bytes), width=Inches(width_inch))
 
 
-@app.post('/generate-offer')
-async def generate_offer(xlsx: UploadFile = File(...)):
-    # Główna funkcja API – przyjmuje XLSX i zwraca DOCX.
-    xlsx_bytes = await xlsx.read()
+# -------------------------------------------------------
+# GŁÓWNY ENDPOINT: GENEROWANIE OFERTY
+# -------------------------------------------------------
 
-    positions = extract_positions(xlsx_bytes)
+@app.post("/generate-offer")
+async def generate_offer(xlsx: UploadFile = File(...)):
+    xlsx_bytes = await xlsx.read()
+    wb = load_workbook(BytesIO(xlsx_bytes), data_only=True)
+
+    # Odczyt pozycji i zdjęć
+    positions = extract_positions(wb)
     images = extract_images(xlsx_bytes)
 
-    for idx, pos in enumerate(positions):
-        if idx < len(images):
-            pos['image'] = images[idx]
+    # Przypisanie zdjęć kolejno
+    for i in range(len(positions)):
+        if i < len(images):
+            positions[i]["image"] = images[i]
 
-    doc = Document('template.docx')
-    if not doc.tables:
-        table = doc.add_table(rows=2, cols=4)
-        hdr = table.rows[0].cells
-        hdr[0].text = 'L.p.'
-        hdr[1].text = 'Rysunek (Widok od zewnątrz), wymiary'
-        hdr[2].text = 'Ilość sztuk'
-        hdr[3].text = 'OPIS'
-        template_row = table.rows[1]
-    else:
-        table = doc.tables[0]
-        if len(table.rows) < 2:
-            table.add_row()
-        template_row = table.rows[1]
+    # Ładowanie template.docx
+    doc = Document("template.docx")
+    table = doc.tables[0]  # pierwsza tabela
+    template_row = table.rows[1]
 
-    # wyczyść wiersz wzorcowy
-    for cell in template_row.cells:
-        cell.text = ''
-
-    # usuń nadmiarowe wiersze
+    # czyścimy starą zawartość
     while len(table.rows) > 2:
         table._tbl.remove(table.rows[-1]._tr)
 
-    # wypełnij pozycjami
-    for idx, pos in enumerate(positions):
-        if idx == 0:
-            row_cells = template_row.cells
-        else:
-            new_row = table.add_row()
-            row_cells = new_row.cells
+    for pos in positions:
+        row = table.add_row().cells
+        row[0].text = str(pos["lp"])
+        row[1].text = pos["nazwa"]
+        if pos["image"]:
+            add_image_to_cell(row[1], pos["image"])
+        row[2].text = pos["ilosc"]
+        row[3].text = pos["opis"]
 
-        row_cells[0].text = str(pos['lp'])
-        name_cell = row_cells[1]
-        name_cell.text = pos['nazwa']
-        if pos.get('image'):
-            add_image_below_text(name_cell, pos['image'], target_px_width=500)
-        row_cells[2].text = str(pos['ilosc'])
-        row_cells[3].text = pos['opis']
-
-    out = BytesIO()
-    doc.save(out)
-    out.seek(0)
+    # generowanie DOCX
+    output = BytesIO()
+    doc.save(output)
+    output.seek(0)
 
     return StreamingResponse(
-        out,
-        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        headers={'Content-Disposition': 'attachment; filename="oferta.docx"'}
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename=oferta.docx"}
     )
+
+
+# -------------------------------------------------------
+# ENDPOINT TESTOWY (opcjonalny)
+# -------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"status": "backend działa", "endpoint": "/generate-offer"}
